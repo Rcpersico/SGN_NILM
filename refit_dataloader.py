@@ -6,7 +6,7 @@ from collections import deque
 
 
 
-def load_house_csv(path, appliance_col="Appliance1", resample_rule="1min", max_minutes=None):
+def load_house_csv(path, appliance_col="Appliance1", resample_rule="1min", max_rows=None):
     df = pd.read_csv(path, low_memory=False)
     df["Time"] = pd.to_datetime(df["Time"], errors="coerce")
     df = df.dropna(subset=["Time"]).set_index("Time")
@@ -14,7 +14,7 @@ def load_house_csv(path, appliance_col="Appliance1", resample_rule="1min", max_m
     df = df[["Aggregate", appliance_col]].astype("float32")
     df = df.resample(resample_rule).mean().fillna(0.0)
 
-    if max_minutes is not None:
-        df = df.iloc[:max_minutes]
+    if max_rows is not None:
+        df = df.iloc[:max_rows]
 
     return df["Aggregate"].values, df[appliance_col].values, df.index
