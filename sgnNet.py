@@ -81,7 +81,7 @@ class Backbone(nn.Module):
 
 class SGN(nn.Module):
     def __init__(self, in_ch=1, hid=64, kind="tcn", k=3, p=0.2,
-                 dilations=(1,2,4,8,16,32,64,128), out_len=1,
+                 dilations=(1,2,4,8,16,32), out_len=1,
                  gate_tau=0.75, gate_floor=0.05, use_calib=True, causal=False):
         
 
