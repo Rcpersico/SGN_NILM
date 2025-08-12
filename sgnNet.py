@@ -81,8 +81,8 @@ class Backbone(nn.Module):
 
 class SGN(nn.Module):
     def __init__(self, in_ch=1, hid=64, kind="tcn", k=3, p=0.2,
-                 dilations=(1,2,4,8,16,32,64,128), out_len=1,
-                 gate_tau=0.75, gate_floor=0.05, use_calib=True, causal=False):
+                 dilations=(1,2,4,8,16,32,64,128,256), out_len=1,
+                 gate_tau=0.75, gate_floor=0.3, use_calib=True, causal=False):
         
 
         super().__init__()
@@ -106,7 +106,7 @@ class SGN(nn.Module):
         h = self.backbone(x)                 # [B, hid, L] with past+future if non-causal
         mid = h.size(-1) // 2
         h = h[:, :, mid:mid+1]               # seq2point center-pick
-        reg = F.relu(self.head_reg(h).squeeze(1))
+        reg = self.head_reg(h).squeeze(1)
         cls_logits = self.head_cls(h).squeeze(1)
         cls_prob = torch.sigmoid(cls_logits / self.gate_tau)
         gate = self.gate_floor + (1.0 - self.gate_floor) * cls_prob
