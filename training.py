@@ -215,7 +215,7 @@ def train_one_epoch_masked(
     model, loader, opt, device,
     alpha_on=1.0, alpha_off=0.05, beta_cls=0.5,
     delta_huber=50.0, focal_gamma=2.0, pos_weight=3.0,
-    max_grad_norm=1.0, scheduler=None,
+    max_grad_norm=1.0, scheduler=None, alpha_reg_raw = 0.5,
 ):
     model.train()
     loss_sum = 0.0
@@ -233,7 +233,7 @@ def train_one_epoch_masked(
             y, s,
             delta_huber=delta_huber,
             alpha_on=alpha_on, alpha_off=alpha_off, beta_cls=beta_cls,
-            focal_gamma=focal_gamma, pos_weight=pos_weight
+            focal_gamma=focal_gamma, pos_weight=pos_weight, alpha_reg_raw= alpha_reg_raw
         )
 
         opt.zero_grad(set_to_none=True)
@@ -327,6 +327,7 @@ def main_train_masked(
     patience=6, min_delta=0.0, ckpt_path="sgn_best.pt",
     use_scheduler=True, plot=True,
     # masked-loss knobs
+    alpha_reg_raw = 0.5,
     alpha_on=1.0, alpha_off=0.05, beta_cls=0.5,
     delta_huber=50.0, focal_gamma=2.0, pos_weight=3.0,
 ):
@@ -358,7 +359,7 @@ def main_train_masked(
             model, dl_tr, opt, device,
             alpha_on=alpha_on, alpha_off=alpha_off, beta_cls=beta_cls,
             delta_huber=delta_huber, focal_gamma=focal_gamma, pos_weight=pos_weight,
-            max_grad_norm=1.0, scheduler=scheduler
+            max_grad_norm=1.0, scheduler=scheduler, alpha_reg_raw = alpha_reg_raw
         )
         va_loss, va_logs = evaluate_loss_masked(
             model, dl_va, device,
