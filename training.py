@@ -117,13 +117,13 @@ def main_train(
     mains_val, target_val,
     win_len=512, batch_size=128, lr=1e-3, epochs=50, kind="tcn",
     patience=6, min_delta=0.0, ckpt_path="sgn_best.pt",
-    use_scheduler=True, plot=True
+    use_scheduler=True, plot=True, stride=32
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = SGN(in_ch=1, hid=64, kind=kind, out_len=1).to(device)
 
     # Datasets share train stats for consistent scaling
-    ds_tr = Seq2PointWindows(mains_train, target_train, win_len=win_len, stride=32, train=True)
+    ds_tr = Seq2PointWindows(mains_train, target_train, win_len=win_len, stride=stride, train=True)
     ds_va = Seq2PointWindows(mains_val, target_val, win_len=win_len, stride=1, train=False,
                              mains_mean=ds_tr.mains_mean, mains_std=ds_tr.mains_std,
                              target_scale=ds_tr.target_scale)
@@ -325,7 +325,7 @@ def main_train_masked(
     mains_val, target_val,
     win_len=512, batch_size=128, lr=1e-3, epochs=50, kind="tcn",
     patience=6, min_delta=0.0, ckpt_path="sgn_best.pt",
-    use_scheduler=True, plot=True,
+    use_scheduler=True, plot=True, stride = 32,
     # masked-loss knobs
     alpha_on=1.0, alpha_off=0.05, beta_cls=0.5,
     delta_huber=50.0, focal_gamma=2.0, pos_weight=3.0,
@@ -333,7 +333,7 @@ def main_train_masked(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = SGN(in_ch=1, hid=64, kind=kind, out_len=1).to(device)
 
-    ds_tr = Seq2PointWindows(mains_train, target_train, win_len=win_len, stride=32, train=True)
+    ds_tr = Seq2PointWindows(mains_train, target_train, win_len=win_len, stride=stride, train=True)
     ds_va = Seq2PointWindows(mains_val,   target_val,   win_len=win_len, stride=1,  train=False,
                              mains_mean=ds_tr.mains_mean, mains_std=ds_tr.mains_std,
                              target_scale=ds_tr.target_scale)
