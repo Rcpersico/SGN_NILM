@@ -2,6 +2,11 @@ import torch
 import numpy as np
 
 
+
+def smape(a, f):
+    denom = (np.abs(a) + np.abs(f)).clip(1e-6, None)
+    return (100.0 / len(a)) * np.sum(np.abs(f - a) / denom)
+
 @torch.no_grad()
 def infer_seq2point_timeline(model, mains, stats, device):
     model.eval()
@@ -17,8 +22,8 @@ def infer_seq2point_timeline(model, mains, stats, device):
     for c in range(half, T - (L - half) + 1):
         seg = x[c-half:c-half+L][None, None, :]           # [1,1,L]
         seg_t = torch.from_numpy(seg).to(device)
-        power, cls, reg = model(seg_t)                    
-        pred = power.squeeze().item()
+        power, cls, reg = model(seg_t)
+        pred = power.squeeze().detach().cpu().item()
         y_hat[c] += pred
         counts[c] += 1.0
 
@@ -28,16 +33,13 @@ def infer_seq2point_timeline(model, mains, stats, device):
     return y_hat
 
 
-
-
-
 @torch.no_grad()
-def infer_seq2point_timeline_all(model, mains, stats, device):
+def infer_seq2point_timeline_all(model, mains, stats, device, gate_tau=0.75):
     """
     Returns arrays length T:
-      power_w : gated power in watts
+      power_w : gated power in watts (soft SGN output)
       reg_w   : regression head (pre-gate) in watts
-      cls_p   : ON probability (0..1)
+      cls_p   : ON probability (0..1), averaged over overlaps
     """
     model.eval()
     x = mains.astype("float32")
@@ -54,10 +56,12 @@ def infer_seq2point_timeline_all(model, mains, stats, device):
         seg = x[c-half:c-half+L][None, None, :]   # [1,1,L]
         seg_t = torch.from_numpy(seg).to(device)
 
-        power, cls_logits, reg = model(seg_t)     # your model returns (power, logits, reg)
-        p  = torch.sigmoid(cls_logits).squeeze().item()
-        pw = power.squeeze().item()
-        rw = reg.squeeze().item()
+        power, cls_logits, reg = model(seg_t)     # (power, logits, reg)
+
+        # Use gate_tau when making probs
+        p  = torch.sigmoid(cls_logits / gate_tau).squeeze().detach().cpu().item()
+        pw = power.squeeze().detach().cpu().item()
+        rw = reg.squeeze().detach().cpu().item()
 
         power_sum[c] += pw
         reg_sum[c]   += rw
@@ -75,3 +79,90 @@ def infer_seq2point_timeline_all(model, mains, stats, device):
     reg_w   = reg   * scale
 
     return power_w, reg_w, prob
+
+
+def hysteresis_gate(prob, t_on=0.65, t_off=0.45, min_hold=3):
+    """
+    prob: np.ndarray shape [T], probabilities in [0,1]
+    Returns gate_hard: uint8 array {0,1} using hysteresis + min-hold.
+    """
+    T = prob.shape[0]
+    gate = np.zeros(T, dtype=np.uint8)
+    state = 0
+    hold = 0
+    for t in range(T):
+        p = prob[t]
+        if state == 0:
+            if p >= t_on:
+                state = 1
+                hold = min_hold
+        else:  # state == 1
+            if hold > 0:
+                hold -= 1
+            elif p <= t_off:
+                state = 0
+        gate[t] = state
+    return gate
+
+
+
+
+def apply_hard_gate(reg_w, prob, *, t_on=0.65, t_off=0.45, min_hold=3, gate_floor=0.0):
+    """
+    Hard-gate the regression output using hysteresis on probabilities.
+    Returns gate_hard {0,1} and power_hard_w.
+    """
+    gate_h = hysteresis_gate(prob, t_on=t_on, t_off=t_off, min_hold=min_hold).astype(np.float32)
+    gate_eff = gate_floor + (1.0 - gate_floor) * gate_h   # 0.0 for true OFF zeros
+    power_hard_w = reg_w * gate_eff
+    return gate_h.astype(np.uint8), power_hard_w
+
+
+
+
+
+@torch.no_grad()
+def infer_seq2point_timeline_all_with_hard(
+    model, mains, stats, device,
+    *,
+    gate_tau=0.75,
+    t_on=0.65, t_off=0.45, min_hold=3,
+    gate_floor=0.0
+):
+    """
+    Convenience wrapper: returns both soft and hard-gated outputs.
+    Returns (all length T):
+      power_soft_w, reg_w, prob, gate_hard, power_hard_w
+    """
+    power_w, reg_w, prob = infer_seq2point_timeline_all(model, mains, stats, device, gate_tau=gate_tau)
+    gate_hard, power_hard_w = apply_hard_gate(
+        reg_w, prob, t_on=t_on, t_off=t_off, min_hold=min_hold, gate_floor=gate_floor
+    )
+    return power_w, reg_w, prob, gate_hard, power_hard_w
+
+
+
+def tune_hysteresis_for_mae(reg_w, prob, y_true, *, min_hold_choices=(2,3,4,5),
+                            t_on_grid=None, t_off_grid=None, gate_floor=0.0):
+    """
+    Grid search (t_on, t_off, min_hold) to minimize MAE of reg_w * gate on validation set.
+    Returns best (t_on, t_off, min_hold, best_mae).
+    """
+    if t_on_grid is None:
+        t_on_grid = np.linspace(0.55, 0.85, 7)
+    if t_off_grid is None:
+        # ensure t_off < t_on when iterating
+        t_off_grid = np.linspace(0.15, 0.55, 9)
+
+    best = (float("inf"), 0.65, 0.45, 3)
+    for t_on in t_on_grid:
+        for t_off in t_off_grid:
+            if t_off >= t_on:  # hysteresis requires t_off < t_on
+                continue
+            for mh in min_hold_choices:
+                gate_h, power_hard = apply_hard_gate(reg_w, prob, t_on=t_on, t_off=t_off, min_hold=mh, gate_floor=gate_floor)
+                mae = float(np.mean(np.abs(power_hard - y_true)))
+                if mae < best[0]:
+                    best = (mae, float(t_on), float(t_off), int(mh))
+    _, b_on, b_off, b_mh = best
+    return b_on, b_off, b_mh, best[0]

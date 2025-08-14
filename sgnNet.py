@@ -106,7 +106,8 @@ class SGN(nn.Module):
         h = self.backbone(x)                 # [B, hid, L] with past+future if non-causal
         mid = h.size(-1) // 2
         h = h[:, :, mid:mid+1]               # seq2point center-pick
-        reg = F.relu(self.head_reg(h).squeeze(1))
+        reg = self.head_reg(h).squeeze(1)
+        reg = F.softplus(reg)
         cls_logits = self.head_cls(h).squeeze(1)
         cls_prob = torch.sigmoid(cls_logits / self.gate_tau)
         gate = self.gate_floor + (1.0 - self.gate_floor) * cls_prob

@@ -32,7 +32,12 @@ def train_one_epoch(model, loader, opt, device, pos_weight= 5.0,
         #compute loss
         loss_reg = F.l1_loss(reg,y)
         loss_gate = F.l1_loss(power,y)
-        bce = F.binary_cross_entropy_with_logits(cls_logits, s, pos_weight=pw)
+
+        tau = float(getattr(model, "gate_tau", 1.0))         # read model's gate temperature
+        logits_t = cls_logits / tau
+        bce = F.binary_cross_entropy_with_logits(logits_t, s, pos_weight=pw)
+        bce = (tau * tau) * bce
+
         loss = w_reg * loss_reg + w_cls * bce + w_gate * loss_gate
         loss.backward()
 
@@ -79,7 +84,12 @@ def evaluate_loss(model, loader, device, pos_weight=5.0, w_reg=1.0, w_cls=0.5, w
 
         loss_reg  = F.l1_loss(reg, y)
         loss_gate = F.l1_loss(power, y)
-        bce = F.binary_cross_entropy_with_logits(cls_logits, s, pos_weight=pw)
+
+        tau = float(getattr(model, "gate_tau", 1.0))         # read model's gate temperature
+        logits_t = cls_logits / tau
+        bce = F.binary_cross_entropy_with_logits(logits_t, s, pos_weight=pw)
+        bce = (tau * tau) * bce
+
         loss = w_reg * loss_reg + w_cls * bce + w_gate * loss_gate
         total += loss.item() * x.size(0)
 
@@ -117,13 +127,13 @@ def main_train(
     mains_val, target_val,
     win_len=512, batch_size=128, lr=1e-3, epochs=50, kind="tcn",
     patience=6, min_delta=0.0, ckpt_path="sgn_best.pt",
-    use_scheduler=True, plot=True
+    use_scheduler=True, plot=True, stride=32
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = SGN(in_ch=1, hid=64, kind=kind, out_len=1).to(device)
 
     # Datasets share train stats for consistent scaling
-    ds_tr = Seq2PointWindows(mains_train, target_train, win_len=win_len, stride=32, train=True)
+    ds_tr = Seq2PointWindows(mains_train, target_train, win_len=win_len, stride=stride, train=True)
     ds_va = Seq2PointWindows(mains_val, target_val, win_len=win_len, stride=1, train=False,
                              mains_mean=ds_tr.mains_mean, mains_std=ds_tr.mains_std,
                              target_scale=ds_tr.target_scale)
@@ -201,7 +211,8 @@ def main_train(
             "mains_mean": ds_tr.mains_mean,
             "mains_std": ds_tr.mains_std,
             "target_scale": ds_tr.target_scale,
-            "win_len": win_len
+            "win_len": win_len,
+        "gate_tau": float(getattr(model, "gate_tau", 1.0))
         }
     }
 
@@ -228,12 +239,15 @@ def train_one_epoch_masked(
         s = s.to(device).squeeze(-1)     # [B] in {0,1}
 
         power, cls_logits, reg = model(x)  # [B,1] each
+        tau = float(getattr(model, "gate_tau", 1.0))
+        cls_logits_t = (cls_logits / tau).squeeze(-1)
+
         loss, logs = sgn_loss(
-            power.squeeze(-1), cls_logits.squeeze(-1), reg.squeeze(-1),
+            power.squeeze(-1), cls_logits_t, reg.squeeze(-1),
             y, s,
             delta_huber=delta_huber,
             alpha_on=alpha_on, alpha_off=alpha_off, beta_cls=beta_cls,
-            focal_gamma=focal_gamma, pos_weight=pos_weight, alpha_reg_raw= alpha_reg_raw
+            focal_gamma=focal_gamma, pos_weight=pos_weight, alpha_reg_raw=alpha_reg_raw
         )
 
         opt.zero_grad(set_to_none=True)
@@ -260,7 +274,7 @@ def train_one_epoch_masked(
 def evaluate_loss_masked(
     model, loader, device,
     alpha_on=1.0, alpha_off=0.05, beta_cls=0.5,
-    delta_huber=50.0, focal_gamma=2.0, pos_weight=3.0,
+    delta_huber=50.0, focal_gamma=2.0, pos_weight=3.0, alpha_reg_raw=0.5,
 ):
     model.eval()
     loss_sum = 0.0
@@ -270,12 +284,16 @@ def evaluate_loss_masked(
     for x, y, s in loader:
         x = x.to(device); y = y.to(device).squeeze(-1); s = s.to(device).squeeze(-1)
         power, cls_logits, reg = model(x)
+        tau = float(getattr(model, "gate_tau", 1.0))
+
+        cls_logits_t = (cls_logits / tau).squeeze(-1)
+
         loss, logs = sgn_loss(
-            power.squeeze(-1), cls_logits.squeeze(-1), reg.squeeze(-1),
+            power.squeeze(-1), cls_logits_t, reg.squeeze(-1),
             y, s,
             delta_huber=delta_huber,
             alpha_on=alpha_on, alpha_off=alpha_off, beta_cls=beta_cls,
-            focal_gamma=focal_gamma, pos_weight=pos_weight
+            focal_gamma=focal_gamma, pos_weight=pos_weight, alpha_reg_raw=alpha_reg_raw
         )
         loss_sum += loss.item()
         for k in logs_sum: logs_sum[k] += logs[k].item()
@@ -325,16 +343,16 @@ def main_train_masked(
     mains_val, target_val,
     win_len=512, batch_size=128, lr=1e-3, epochs=50, kind="tcn",
     patience=6, min_delta=0.0, ckpt_path="sgn_best.pt",
-    use_scheduler=True, plot=True,
+    use_scheduler=True, plot=True, stride = 32,
     # masked-loss knobs
     alpha_reg_raw = 0.5,
     alpha_on=1.0, alpha_off=0.05, beta_cls=0.5,
-    delta_huber=50.0, focal_gamma=2.0, pos_weight=3.0,
+    delta_huber=50.0, focal_gamma=2.0, pos_weight=3.0, on_sample_prob = 0.25,
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = SGN(in_ch=1, hid=64, kind=kind, out_len=1).to(device)
 
-    ds_tr = Seq2PointWindows(mains_train, target_train, win_len=win_len, stride=32, train=True)
+    ds_tr = Seq2PointWindows(mains_train, target_train, win_len=win_len, stride=stride, train=True, on_sample_prob = on_sample_prob)
     ds_va = Seq2PointWindows(mains_val,   target_val,   win_len=win_len, stride=1,  train=False,
                              mains_mean=ds_tr.mains_mean, mains_std=ds_tr.mains_std,
                              target_scale=ds_tr.target_scale)
@@ -364,7 +382,8 @@ def main_train_masked(
         va_loss, va_logs = evaluate_loss_masked(
             model, dl_va, device,
             alpha_on=alpha_on, alpha_off=alpha_off, beta_cls=beta_cls,
-            delta_huber=delta_huber, focal_gamma=focal_gamma, pos_weight=pos_weight
+            delta_huber=delta_huber, focal_gamma=focal_gamma, pos_weight=pos_weight,
+            alpha_reg_raw=alpha_reg_raw
         )
         va_mae = evaluate_mae(model, dl_va, device, target_scale=ds_tr.target_scale)
 
@@ -422,6 +441,7 @@ def main_train_masked(
             "mains_mean": ds_tr.mains_mean,
             "mains_std": ds_tr.mains_std,
             "target_scale": ds_tr.target_scale,
-            "win_len": win_len
+            "win_len": win_len,
+            "gate_tau": float(getattr(model, "gate_tau", 1.0))
         }
     }
