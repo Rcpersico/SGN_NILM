@@ -63,3 +63,21 @@ def plot_hard(y_true, power_hard_w, gate_hard, on_threshold=15.0, N=None, show=T
     ax2.set_ylabel("ON / Gate")
     ax2.legend()
     plt.tight_layout(); plt.show()
+
+
+
+def plot_mains(mains_w, N=None, show=True):
+    """
+    Plot the aggregate mains signal alone.
+    """
+    if not show:
+        return
+    if N is None: 
+        N = len(mains_w)
+    N = min(N, len(mains_w))
+
+    plt.figure(figsize=(12,4))
+    plt.plot(mains_w[:N], label="Mains (aggregate)", linewidth=1.0, alpha=0.9)
+    plt.xlabel("Timestep"); plt.ylabel("Power (W)")
+    plt.title("Aggregate Mains Signal (test slice)")
+    plt.legend(); plt.tight_layout(); plt.show()

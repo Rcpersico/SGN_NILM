@@ -8,8 +8,7 @@ def make_onoff_labels(target_watts, on_threshold=20.0, off_threshold=10.0, min_h
     for i, p in enumerate(target_watts):
         if state == 0:
             if p >= on_threshold:
-                state = 1
-                hold = min_hold
+                state, hold = 1, min_hold
         else:
             if p <= off_threshold and hold <= 0:
                 state = 0
@@ -19,17 +18,15 @@ def make_onoff_labels(target_watts, on_threshold=20.0, off_threshold=10.0, min_h
     return on
 
 class Seq2PointWindows(Dataset):
-    """
-    If balance_sampling=True, we can oversample ON centers via on_sample_prob.
-    If balance_sampling=False, sampling is unbiased (natural temporal dist).
-    """
     def __init__(self,
                  mains, target,
                  win_len=512, stride=32,
                  mains_mean=None, mains_std=None, target_scale=None,
                  train=True,
                  on_threshold=20.0, off_threshold=10.0, min_hold=1,
-                 balance_sampling=True, on_sample_prob=0.5):
+                 balance_sampling=True, on_sample_prob=0.5,
+                 # NEW: fraction of batches to draw from transition (ON↔OFF) edges
+                 edge_sample_prob=0.0):
         assert len(mains) == len(target)
         self.mains = mains.astype(np.float32)
         self.target = target.astype(np.float32)
@@ -37,6 +34,7 @@ class Seq2PointWindows(Dataset):
         self.train = train
         self.balance_sampling = bool(balance_sampling) and bool(train)
         self.on_sample_prob = float(on_sample_prob)
+        self.edge_sample_prob = float(np.clip(edge_sample_prob, 0.0, 1.0))
 
         self.mains_mean = float(np.mean(self.mains)) if mains_mean is None else float(mains_mean)
         self.mains_std  = float(np.std(self.mains) + 1e-6) if mains_std is None else float(mains_std)
@@ -46,18 +44,17 @@ class Seq2PointWindows(Dataset):
         self.target = self.target / (self.target_scale + 1e-6)
 
         target_watts = self.target * (self.target_scale + 1e-6)
-        self.onoff = make_onoff_labels(
-            target_watts,
-            on_threshold=on_threshold,
-            off_threshold=off_threshold,
-            min_hold=min_hold
-        )
+        self.onoff = make_onoff_labels(target_watts,
+                                       on_threshold=on_threshold,
+                                       off_threshold=off_threshold,
+                                       min_hold=min_hold)
 
         half = win_len // 2
         valid = np.arange(half, len(self.mains) - (win_len - half) + 1)
         self.centers = valid
         self.stride = stride if train else 1
 
+        # Class-balance pools (for reg loader or optional cls OFF-tilt)
         if self.balance_sampling:
             on_mask = (self.onoff[self.centers] == 1)
             self.on_centers  = self.centers[on_mask]
@@ -67,33 +64,45 @@ class Seq2PointWindows(Dataset):
             if len(self.off_centers) == 0:
                 self.off_centers = self.on_centers
 
+        # NEW: transition/edge pool (for CLS emphasis)
+        # mark centers where label changes within ±1 step
+        change = np.zeros_like(self.onoff, dtype=bool)
+        change[1:]  |= (self.onoff[1:]  != self.onoff[:-1])
+        change[:-1] |= (self.onoff[:-1] != self.onoff[1:])
+        self.edge_centers = self.centers[change[self.centers]]
+
     def __len__(self):
         if self.train:
             return max(1, len(self.centers) // self.stride)
         return len(self.centers)
 
     def _sample_center(self):
+        # 1) If class-balanced sampling is enabled (reg or optional cls OFF-tilt)
         if self.balance_sampling and len(self.on_centers) > 0 and len(self.off_centers) > 0:
             if np.random.rand() < self.on_sample_prob:
                 return int(np.random.choice(self.on_centers))
             else:
                 return int(np.random.choice(self.off_centers))
+
+        # 2) Otherwise, unbiased… but allow edge oversampling for CLS if requested
+        if self.train and self.edge_sample_prob > 0.0 and len(self.edge_centers) > 0:
+            if np.random.rand() < self.edge_sample_prob:
+                return int(np.random.choice(self.edge_centers))
+
+        # 3) Plain unbiased
         return int(np.random.choice(self.centers))
 
     def __getitem__(self, idx):
         c = self._sample_center() if self.train else int(self.centers[idx])
-        L = self.win_len
-        half = L // 2
-        start, end = c - half, c - half + L
-
+        L = self.win_len; half = L // 2
+        start = c - half; end = start + L
         x = self.mains[start:end]
         y = self.target[c]
         s = self.onoff[c]
-
         return (
-            torch.from_numpy(x[None, :]),            # (1, L)
-            torch.tensor([y], dtype=torch.float32),  # (1,)
-            torch.tensor([s], dtype=torch.float32),  # (1,)
+            torch.from_numpy(x[None, :]),
+            torch.tensor([y], dtype=torch.float32),
+            torch.tensor([s], dtype=torch.float32),
         )
 
     @property
