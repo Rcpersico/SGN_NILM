@@ -102,6 +102,40 @@ def evaluate_loss_masked(
     return total / max(1, n)
 
 
+
+@torch.no_grad()
+def evaluate_loss_mode(
+    model, loader, device, *,
+    mode: str,                       # "reg" | "cls" | "all"
+    alpha_on, alpha_off, alpha_reg_raw,
+    beta_cls, delta_huber, focal_gamma, pos_weight
+):
+    """
+    Phase-matched validator:
+      - mode="reg":   regression-only (beta_cls=0)
+      - mode="cls":   classification-only (reg weights 0, delta_huber=0)
+      - mode="all":   full composite (same as evaluate_loss_masked default)
+    Returns per-sample mean loss.
+    """
+    if mode == "reg":
+        a_on, a_off, a_raw, b_cls, d_h = alpha_on, alpha_off, alpha_reg_raw, 0.0, delta_huber
+    elif mode == "cls":
+        a_on, a_off, a_raw, b_cls, d_h = 0.0, 0.0, 0.0, 1.0, 0.0
+    elif mode == "all":
+        a_on, a_off, a_raw, b_cls, d_h = alpha_on, alpha_off, alpha_reg_raw, beta_cls, delta_huber
+    else:
+        raise ValueError("mode must be 'reg', 'cls', or 'all'")
+
+    return evaluate_loss_masked(
+        model, loader, device,
+        alpha_on=a_on, alpha_off=a_off, alpha_reg_raw=a_raw,
+        beta_cls=b_cls, delta_huber=d_h,
+        focal_gamma=focal_gamma, pos_weight=pos_weight
+    )
+
+
+
+
 # -------------------------
 # Loaders for staged training
 # -------------------------
@@ -235,54 +269,55 @@ def pretrain_classifier_one_epoch(
 # -------------------------
 # Phase 3: Joint training (two batches per step → one loss)
 # -------------------------
-def joint_train_one_epoch_dualbatch(
+def joint_train_one_epoch_composite(
     model, dl_tr_reg, dl_tr_cls, opt, device,
     delta_huber, pos_weight, focal_gamma,
     alpha_on=1.0, alpha_reg_raw=1.0, alpha_off=0.02, beta_cls=1.5
 ):
+    """
+    Train with the SAME composite objective used in validation:
+    loss = reg(on/off) + alpha_reg_raw*raw_reg + beta_cls*cls
+    on BOTH the reg batch and the cls batch; then combine sample-weighted.
+    This keeps the classifier learning (beta_cls>0) and aligns train/val formulas.
+    """
     model.train()
-    set_requires_grad(model.head_reg, True)
-    set_requires_grad(model.head_cls, True)
-    set_requires_grad(model.backbone, True)
+    # all heads & backbone learn in joint
+    for p in model.parameters():
+        p.requires_grad = True
 
-    total = 0.0
-    steps = 0
+    total, nsamp = 0.0, 0
 
     for (x_r, y_r, s_r), (x_c, y_c, s_c) in zip(cycle(dl_tr_reg), dl_tr_cls):
-        # --- reg batch (ON-rich) ---
-        x_r = x_r.to(device); y_r = y_r.to(device).squeeze(-1); s_r = s_r.to(device).squeeze(-1)
-        power_r, cls_logits_r, reg_r = model(x_r)
+        # Merge the two mini-batches (keeps your sampling biases but one forward/backward)
+        x = torch.cat([x_r, x_c], dim=0).to(device)
+        y = torch.cat([y_r, y_c], dim=0).to(device).squeeze(-1)
+        s = torch.cat([s_r, s_c], dim=0).to(device).squeeze(-1)
+
+        power, cls_logits, reg = model(x)
         tau = float(getattr(model, "gate_tau", 1.0))
-        logits_r_t = (cls_logits_r / tau).squeeze(-1)
-        loss_reg, _ = sgn_loss(
-            power_r.squeeze(-1), logits_r_t, reg_r.squeeze(-1),
-            y_r, s_r,
+        logits_t = (cls_logits / tau).squeeze(-1)
+
+        # FULL composite – same as validation
+        loss, _ = sgn_loss(
+            power.squeeze(-1), logits_t, reg.squeeze(-1),
+            y, s,
             delta_huber=delta_huber,
             alpha_on=alpha_on, alpha_reg_raw=alpha_reg_raw, alpha_off=alpha_off,
-            beta_cls=0.0, focal_gamma=focal_gamma, pos_weight=None
-        )
-
-        # --- cls batch (unbiased/OFF-tilted + edges) ---
-        x_c = x_c.to(device); y_c = y_c.to(device).squeeze(-1); s_c = s_c.to(device).squeeze(-1)
-        power_c, cls_logits_c, reg_c = model(x_c)
-        logits_c_t = (cls_logits_c / tau).squeeze(-1)
-        loss_cls, _ = sgn_loss(
-            power_c.squeeze(-1), logits_c_t, reg_c.squeeze(-1),
-            y_c, s_c,
-            delta_huber=0.0,
-            alpha_on=0.0, alpha_reg_raw=0.0, alpha_off=0.0,
             beta_cls=beta_cls, focal_gamma=focal_gamma, pos_weight=pos_weight
         )
 
-        loss = loss_reg + loss_cls
         opt.zero_grad(set_to_none=True)
         loss.backward()
-        clip_grad_norm_(model.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
 
-        total += loss.item(); steps += 1
+        bs = x.size(0)
+        total  += loss.item() * bs   # per-sample accumulator
+        nsamp  += bs
 
-    return total / max(1, steps)
+    # Return per-sample mean, same reduction as evaluate_loss_masked
+    return total / max(1, nsamp)
+
 
 
 # -------------------------
@@ -366,7 +401,22 @@ def main_train_staged(
             model, dl_va, device, target_scale=ds_tr_reg.target_scale
         )
         va_loss, va_mae = eval_all()
-        print(f"[REG] Epoch {ep:03d} | Train {tr:.4f} | ValLoss {va_loss:.4f} | ValMAE {va_mae:.2f} | MAE@ON {va_mae_on:.2f} | MAE@OFF {va_mae_off:.2f}")
+
+        # Phase-matched: regression-only validation loss (no CLS term)
+        val_loss_regonly = evaluate_loss_mode(
+            model, dl_va, device, mode="reg",
+            alpha_on=alpha_on, alpha_off=alpha_off, alpha_reg_raw=alpha_reg_raw,
+            beta_cls=beta_cls, delta_huber=delta_huber,
+            focal_gamma=focal_gamma, pos_weight=pos_weight
+)
+
+
+        print(
+        f"[REG] Epoch {ep:03d} | Train {tr:.4f} | "
+        f"ValLoss(REG-only) {val_loss_regonly:.4f} | ValLoss(all) {va_loss:.4f} | "
+        f"ValMAE {va_mae:.2f} | MAE@ON {va_mae_on:.2f} | MAE@OFF {va_mae_off:.2f}"
+        )
+
 
         improved = (best_reg_metric - va_mae_on) > reg_es_min_delta
         if improved:
@@ -398,7 +448,20 @@ def main_train_staged(
             model, dl_va, device, target_scale=ds_tr_reg.target_scale
         )
         va_loss, va_mae = eval_all()
-        print(f"[CLS] Epoch {ep:03d} | Train {tr:.4f} | ValLoss {va_loss:.4f} | ValMAE {va_mae:.2f} | MAE@ON {va_mae_on:.2f} | MAE@OFF {va_mae_off:.2f}")
+
+        val_loss_clsonly = evaluate_loss_mode(
+            model, dl_va, device, mode="cls",
+            alpha_on=alpha_on, alpha_off=alpha_off, alpha_reg_raw=alpha_reg_raw,
+            beta_cls=beta_cls, delta_huber=delta_huber,  # delta ignored in cls mode
+            focal_gamma=focal_gamma, pos_weight=pos_weight
+        )
+
+        print(
+            f"[CLS] Epoch {ep:03d} | Train {tr:.4f} | "
+            f"ValLoss(CLS-only) {val_loss_clsonly:.4f} | ValLoss(all) {va_loss:.4f} | "
+            f"ValMAE {va_mae:.2f} | MAE@ON {va_mae_on:.2f} | MAE@OFF {va_mae_off:.2f}"
+        )
+
 
         improved = (best_cls_metric - va_mae_off) > cls_es_min_delta
         if improved:
@@ -417,7 +480,7 @@ def main_train_staged(
 
     # ---- Phase 3: Joint training (early stop on overall Val MAE) ----
     for ep in range(1, epochs_joint + 1):
-        tr = joint_train_one_epoch_dualbatch(
+        tr = joint_train_one_epoch_composite(
             model, dl_tr_reg, dl_tr_cls, opt, device,
             delta_huber=delta_huber, pos_weight=pos_weight, focal_gamma=focal_gamma,
             alpha_on=alpha_on, alpha_reg_raw=alpha_reg_raw, alpha_off=alpha_off, beta_cls=beta_cls

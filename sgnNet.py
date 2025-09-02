@@ -1,6 +1,21 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+def auto_tcn_dilations(win_len: int) -> tuple[int, ...]:
+    if win_len < 8:
+        return (1,)  # smallest sensible set
+    max_target = max(1, win_len // 8)        # e.g., 64→8, 256→32, 1024→128
+    # largest power of two <= max_target
+    d = 1
+    while (d << 1) <= max_target:
+        d <<= 1
+    # build (1, 2, 4, ..., d)
+    L = int(math.log2(d)) + 1
+    return tuple(1 << i for i in range(L))
+
+
 
 # -------------------------
 # Blocks
@@ -71,27 +86,29 @@ class Backbone(nn.Module):
         return h
 
 
-# -------------------------
-# SGN (seq2point)
-# -------------------------
 class SGN(nn.Module):
-    """
-    Outputs:
-      power : gated power (soft gate inside forward)
-      cls_logits : raw logits (use tau outside if needed)
-      reg : regression magnitude (pre-gate, nonnegative)
-    """
     def __init__(self, in_ch=1, hid=64, kind="tcn", k=3, p=0.2,
-                 dilations=(1, 2, 4, 8, 16, 32), out_len=1,
+                 dilations="auto", out_len=1, win_len=None,
                  gate_tau=0.75, gate_floor=0.05, use_calib=True, causal=False):
         super().__init__()
+        if kind == "tcn":
+            if dilations in (None, "auto"):
+                if win_len is None:
+                    # fallback to previous default if no window length provided
+                    dilations = (1, 2, 4, 8, 16, 32)
+                else:
+                    dilations = auto_tcn_dilations(int(win_len))
+            depth = len(dilations)
+        else:
+            depth = 6  # cnn default
+
         self.out_len = out_len
         self.gate_tau = gate_tau
         self.gate_floor = gate_floor
+
         self.backbone = Backbone(
             in_ch=in_ch, hid=hid,
-            depth=len(dilations) if kind == "tcn" else 6,
-            kind=kind, k=k, p=p,
+            depth=depth, kind=kind, k=k, p=p,
             dilations=dilations if kind == "tcn" else None,
             causal=causal
         )
@@ -104,13 +121,12 @@ class SGN(nn.Module):
             self.calib_bias = nn.Parameter(torch.tensor(0.0))
 
     def forward(self, x):
-        # x: [B, 1, L]
         h = self.backbone(x)
         mid = h.size(-1) // 2
         h = h[:, :, mid:mid+1]  # seq2point center
 
         reg = self.head_reg(h).squeeze(1)
-        reg = F.softplus(reg)   # nonnegative magnitude
+        reg = F.softplus(reg)
 
         cls_logits = self.head_cls(h).squeeze(1)
         cls_prob = torch.sigmoid(cls_logits / self.gate_tau)
